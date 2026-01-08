@@ -32,5 +32,7 @@ u-boot.cfg
 __pycache__
 output/*
 output_gpt/*
+output_simg/*
 mt798x_gpt_bin/*
+mt798x_simg/*
 unopen/*

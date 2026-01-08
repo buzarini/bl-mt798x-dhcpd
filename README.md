@@ -23,7 +23,7 @@ Support Actions to build automatically, generate normal/overclocking BL2.
 ## Prepare
 
 ```bash
-sudo apt install gcc-aarch64-linux-gnu build-essential flex bison libssl-dev device-tree-compiler qemu-user-static python2-dev swig
+sudo apt install gcc-aarch64-linux-gnu build-essential flex bison libssl-dev device-tree-compiler qemu-user-static
 ```
 
 ## Build
@@ -53,6 +53,14 @@ Generate file will be in `output`
 
 ## Generate GPT with python2.7
 
+> install denpendencies
+
+```bash
+sudo apt-get install python2-dev swig
+```
+
+> run
+
 ```bash
 chmod +x generate_gpt.sh
 ./generate_gpt.sh
@@ -71,6 +79,7 @@ Create a directory named `mt798x_gpt_bin` in the respository root directory, and
 Then run:
 
 ```bash
+chmod +x show_gpt.sh
 ./show_gpt.sh
 ```
 
@@ -86,6 +95,8 @@ Then it will show the GPT partition info of all gpt bin files in `mt798x_gpt_bin
 - [ ] Special subnet support (Custom default IP for DHCPD)
 
 > Although you can customize the dhcpd subnet, but the mask is fixed to "255.255.255.0", so you must ensure your device is in this subnet.
+
+---
 
 ## FIT support
 
