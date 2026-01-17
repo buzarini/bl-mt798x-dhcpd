@@ -16,26 +16,23 @@
 #include <net/mtk_httpd.h>
 #include <net/mtk_dhcpd.h>
 #include <u-boot/md5.h>
+#include <asm/global_data.h>
+#include <linux/kernel.h>
 #include <linux/stringify.h>
+#include <linux/ctype.h>
+#ifdef CONFIG_MTD
+#include <linux/mtd/mtd.h>
+#include <linux/mtd/nand.h>
+#include <linux/mtd/spi-nor.h>
+#include <linux/mtd/spinand.h>
+#endif
+#include <limits.h>
 #include <dm/ofnode.h>
 #include <vsprintf.h>
 #include <version_string.h>
 #include <failsafe/fw_type.h>
 
-#include "../board/mediatek/common/boot_helper.h"
-#include "fs.h"
-
-static u32 upload_data_id;
-static const void *upload_data;
-static size_t upload_size;
-static int upgrade_success;
-static failsafe_fw_t fw_type;
-
-#ifdef CONFIG_MEDIATEK_MULTI_MTD_LAYOUT
-static const char *mtd_layout_label;
-const char *get_mtd_layout_label(void);
-#define MTD_LAYOUTS_MAXLEN	128
-#endif
+DECLARE_GLOBAL_DATA_PTR;
 
 int __weak failsafe_validate_image(const void *data, size_t size, failsafe_fw_t fw)
 {
@@ -47,47 +44,61 @@ int __weak failsafe_write_image(const void *data, size_t size, failsafe_fw_t fw)
 	return -ENOSYS;
 }
 
-static int output_plain_file(struct httpd_response *response,
-			     const char *filename)
-{
-	const struct fs_desc *file;
-	int ret = 0;
+#include "../board/mediatek/common/boot_helper.h"
+#ifdef CONFIG_MTD
+#include "../board/mediatek/common/mtd_helper.h"
+#endif
+#ifdef CONFIG_MTK_BOOTMENU_MMC
+#include "../board/mediatek/common/mmc_helper.h"
+#endif
+#include "fs.h"
 
-	file = fs_find_file(filename);
+static u32 upload_data_id;
+static const void *upload_data;
+
+/*
+ * mtk_httpd exposes a global symbol named `upload_id`.
+ * Avoid colliding with it by using a failsafe-local name.
+ */
+static u32 fs_upload_id;
+static size_t upload_size;
+static failsafe_fw_t fw_type;
+static bool upgrade_success;
+#ifdef CONFIG_MEDIATEK_MULTI_MTD_LAYOUT
+static const char *mtd_layout_label;
+const char *get_mtd_layout_label(void);
+#define MTD_LAYOUTS_MAXLEN 128
+#endif
+
+#ifdef CONFIG_MTK_BOOTMENU_MMC
+static bool failsafe_mmc_present(void)
+{
+	struct mmc *mmc;
+	struct blk_desc *bd;
+
+	mmc = _mmc_get_dev(CONFIG_MTK_BOOTMENU_MMC_DEV_INDEX, 0, false);
+	bd = mmc ? mmc_get_blk_desc(mmc) : NULL;
+
+	return mmc && bd && bd->type != DEV_TYPE_UNKNOWN;
+}
+#endif
+
+static int output_plain_file(struct httpd_response *response, const char *path)
+{
+	const struct fs_desc *fd;
+
+	fd = fs_find_file(path);
+	if (!fd)
+		return -ENOENT;
 
 	response->status = HTTP_RESP_STD;
-
-	if (file) {
-		response->data = file->data;
-		response->size = file->size;
-	} else {
-		response->data = "Error: file not found";
-		response->size = strlen(response->data);
-		ret = 1;
-	}
-
+	response->data = fd->data;
+	response->size = fd->size;
 	response->info.code = 200;
 	response->info.connection_close = 1;
 	response->info.content_type = "text/html";
 
-	return ret;
-}
-
-static void version_handler(enum httpd_uri_handler_status status,
-	struct httpd_request *request,
-	struct httpd_response *response)
-{
-	if (status != HTTP_CB_NEW)
-		return;
-
-	response->status = HTTP_RESP_STD;
-
-	response->data = version_string;
-	response->size = strlen(response->data);
-
-	response->info.code = 200;
-	response->info.connection_close = 1;
-	response->info.content_type = "text/plain";
+	return 0;
 }
 
 static void index_handler(enum httpd_uri_handler_status status,
@@ -96,6 +107,872 @@ static void index_handler(enum httpd_uri_handler_status status,
 {
 	if (status == HTTP_CB_NEW)
 		output_plain_file(response, "index.html");
+}
+
+static void version_handler(enum httpd_uri_handler_status status,
+			    struct httpd_request *request,
+			    struct httpd_response *response)
+{
+	if (status != HTTP_CB_NEW)
+		return;
+
+	response->status = HTTP_RESP_STD;
+	response->data = version_string;
+	response->size = strlen(response->data);
+	response->info.code = 200;
+	response->info.connection_close = 1;
+	response->info.content_type = "text/plain";
+}
+
+struct reboot_session {
+	int dummy;
+};
+
+static size_t json_escape(char *dst, size_t dst_sz, const char *src)
+{
+	size_t di = 0;
+	const unsigned char *s = (const unsigned char *)src;
+
+	if (!dst || !dst_sz)
+		return 0;
+
+	if (!src)
+	{
+		dst[0] = '\0';
+		return 0;
+	}
+
+	while (*s && di + 2 < dst_sz)
+	{
+		unsigned char c = *s++;
+
+		if (c == '"' || c == '\\')
+		{
+			if (di + 2 >= dst_sz)
+				break;
+			dst[di++] = '\\';
+			dst[di++] = (char)c;
+			continue;
+		}
+
+		if (c < 0x20)
+		{
+			/* skip control chars */
+			dst[di++] = ' ';
+			continue;
+		}
+
+		dst[di++] = (char)c;
+	}
+
+	dst[di] = '\0';
+	return di;
+}
+
+static void sysinfo_handler(enum httpd_uri_handler_status status,
+							struct httpd_request *request,
+							struct httpd_response *response)
+{
+	char *buf;
+	int len = 0;
+	int left = 4096;
+	off_t ram_size = 0;
+	ofnode root, cpus, cpu;
+	const char *board_model = NULL;
+	const char *board_compat = NULL;
+	const char *cpu_compat = NULL;
+	u64 cpu_clk_hz = 0;
+	char esc_board_model[256], esc_board_compat[256], esc_cpu_compat[256];
+
+	(void)request;
+
+	if (status == HTTP_CB_CLOSED)
+	{
+		free(response->session_data);
+		return;
+	}
+
+	if (status != HTTP_CB_NEW)
+		return;
+
+	buf = malloc(left);
+	if (!buf)
+	{
+		response->status = HTTP_RESP_STD;
+		response->data = "{}";
+		response->size = strlen(response->data);
+		response->info.code = 500;
+		response->info.connection_close = 1;
+		response->info.content_type = "application/json";
+		return;
+	}
+
+	root = ofnode_path("/");
+	if (ofnode_valid(root))
+	{
+		board_model = ofnode_read_string(root, "model");
+		board_compat = ofnode_read_string(root, "compatible");
+	}
+
+	if (!board_model || !board_model[0])
+	{
+		board_model = env_get("model");
+		if (!board_model || !board_model[0])
+			board_model = env_get("board_name");
+		if (!board_model || !board_model[0])
+			board_model = env_get("board");
+	}
+
+	/* CPU info from DT: /cpus/<first cpu node>/compatible, clock-frequency */
+	cpus = ofnode_path("/cpus");
+	if (ofnode_valid(cpus) && ofnode_get_child_count(cpus))
+	{
+		ofnode_for_each_subnode(cpu, cpus)
+		{
+			cpu_compat = ofnode_read_string(cpu, "compatible");
+			if (!ofnode_read_u64(cpu, "clock-frequency", &cpu_clk_hz) && cpu_clk_hz)
+				break;
+			if (cpu_compat && cpu_compat[0])
+				break;
+		}
+	}
+
+	/* RAM size from global data */
+	if (gd)
+		ram_size = (off_t)gd->ram_size;
+
+	json_escape(esc_board_model, sizeof(esc_board_model), board_model ? board_model : "");
+	json_escape(esc_board_compat, sizeof(esc_board_compat), board_compat ? board_compat : "");
+	json_escape(esc_cpu_compat, sizeof(esc_cpu_compat), cpu_compat ? cpu_compat : "");
+
+	len += snprintf(buf + len, left - len, "{");
+	len += snprintf(buf + len, left - len,
+					"\"board\":{\"model\":\"%s\",\"compatible\":\"%s\"},",
+					esc_board_model, esc_board_compat);
+	len += snprintf(buf + len, left - len,
+					"\"cpu\":{\"compatible\":\"%s\",\"clock_hz\":%llu},",
+					esc_cpu_compat, (unsigned long long)cpu_clk_hz);
+	len += snprintf(buf + len, left - len,
+					"\"ram\":{\"size\":%llu}",
+					(unsigned long long)ram_size);
+	len += snprintf(buf + len, left - len, "}");
+
+	response->status = HTTP_RESP_STD;
+	response->data = buf;
+	response->size = strlen(buf);
+	response->info.code = 200;
+	response->info.connection_close = 1;
+	response->info.content_type = "application/json";
+
+	/* response data must stay valid until sent */
+	response->session_data = buf;
+}
+
+static void reboot_handler(enum httpd_uri_handler_status status,
+			   struct httpd_request *request,
+			   struct httpd_response *response)
+{
+	struct reboot_session *st;
+
+	if (status == HTTP_CB_NEW) {
+		st = calloc(1, sizeof(*st));
+		if (!st) {
+			response->info.code = 500;
+			return;
+		}
+
+		response->session_data = st;
+		response->status = HTTP_RESP_STD;
+		response->data = "rebooting";
+		response->size = strlen(response->data);
+		response->info.code = 200;
+		response->info.connection_close = 1;
+		response->info.content_type = "text/plain";
+		return;
+	}
+
+	if (status == HTTP_CB_CLOSED) {
+		st = response->session_data;
+		free(st);
+
+		/* Make sure the current HTTP session has fully closed before reset */
+		mtk_tcp_close_all_conn();
+		do_reset(NULL, 0, 0, NULL);
+	}
+}
+
+enum backup_phase {
+	BACKUP_PHASE_HDR = 0,
+	BACKUP_PHASE_DATA = 1,
+};
+
+enum backup_src {
+	BACKUP_SRC_MTD = 0,
+	BACKUP_SRC_MMC = 1,
+};
+
+struct backup_session {
+	enum backup_src src;
+	enum backup_phase phase;
+
+	u64 start;
+	u64 end;
+	u64 total;
+	u64 cur;
+	u64 target_size;
+
+	char filename[128];
+	char hdr[512];
+	int hdr_len;
+
+	void *buf;
+	size_t buf_size;
+
+#ifdef CONFIG_MTD
+	struct mtd_info *mtd;
+#endif
+#ifdef CONFIG_MTK_BOOTMENU_MMC
+	struct mmc *mmc;
+	struct disk_partition dpart;
+	u64 mmc_base;
+#endif
+};
+
+static void str_sanitize_component(char *s)
+{
+	char *p;
+
+	if (!s)
+		return;
+
+	for (p = s; *p; p++) {
+		unsigned char c = *p;
+
+		if (isalnum(c) || c == '-' || c == '_' || c == '.')
+			continue;
+
+		*p = '_';
+	}
+}
+
+static int parse_u64_len(const char *s, u64 *out)
+{
+	char *end;
+	unsigned long long v;
+
+	if (!s || !*s || !out)
+		return -EINVAL;
+
+	v = simple_strtoull(s, &end, 0);
+	if (end == s)
+		return -EINVAL;
+
+	while (*end == ' ' || *end == '\t')
+		end++;
+
+	if (!*end) {
+		*out = (u64)v;
+		return 0;
+	}
+
+	if (!strcasecmp(end, "k") || !strcasecmp(end, "kb") ||
+	    !strcasecmp(end, "kib")) {
+		*out = (u64)v * 1024ULL;
+		return 0;
+	}
+
+	return -EINVAL;
+}
+
+static bool mtd_part_exists(const char *name)
+{
+#ifdef CONFIG_MTD
+	struct mtd_info *mtd;
+
+	if (!name || !*name)
+		return false;
+
+	gen_mtd_probe_devices();
+	mtd = get_mtd_device_nm(name);
+	if (IS_ERR(mtd))
+		return false;
+
+	put_mtd_device(mtd);
+	return true;
+#else
+	(void)name;
+	return false;
+#endif
+}
+
+#ifdef CONFIG_MTD
+static const struct spinand_info *failsafe_spinand_match_info(struct spinand_device *spinand)
+{
+	size_t i;
+	const struct spinand_manufacturer *manufacturer;
+	const u8 *id;
+
+	if (!spinand)
+		return NULL;
+
+	manufacturer = spinand->manufacturer;
+	if (!manufacturer || !manufacturer->chips || !manufacturer->nchips)
+		return NULL;
+
+	id = spinand->id.data;
+
+	for (i = 0; i < manufacturer->nchips; i++) {
+		const struct spinand_info *info = &manufacturer->chips[i];
+
+		if (!info->devid.id || !info->devid.len)
+			continue;
+
+		/* spinand->id.data[0] is manufacturer ID, device ID starts from [1]. */
+		if (spinand->id.len < (int)(1 + info->devid.len))
+			continue;
+
+		if (!memcmp(id + 1, info->devid.id, info->devid.len))
+			return info;
+	}
+
+	return NULL;
+}
+
+static const char *failsafe_get_mtd_chip_model(struct mtd_info *mtd, char *out, size_t out_sz)
+{
+	if (!out || !out_sz)
+		return "";
+
+	out[0] = '\0';
+
+	if (!mtd)
+		return "";
+
+	/* SPI NOR: mtd->priv points to struct spi_nor (see spi-nor-core.c). */
+	if (mtd->type == MTD_NORFLASH) {
+		struct spi_nor *nor = mtd->priv;
+
+		if (nor && nor->name && nor->name[0]) {
+			snprintf(out, out_sz, "%s", nor->name);
+			return out;
+		}
+	}
+
+#if IS_ENABLED(CONFIG_MTD_SPI_NAND)
+	/* SPI NAND: mtd->priv points to struct nand_device embedded in spinand_device. */
+	if (mtd->type == MTD_NANDFLASH || mtd->type == MTD_MLCNANDFLASH) {
+		struct spinand_device *spinand = mtd_to_spinand(mtd);
+		const struct spinand_manufacturer *manufacturer;
+		const struct spinand_info *info;
+		const char *mname = NULL;
+		const char *model = NULL;
+
+		if (spinand) {
+			manufacturer = spinand->manufacturer;
+			info = failsafe_spinand_match_info(spinand);
+
+			if (manufacturer && manufacturer->name && manufacturer->name[0])
+				mname = manufacturer->name;
+			if (info && info->model && info->model[0])
+				model = info->model;
+
+			if (mname && model) {
+				snprintf(out, out_sz, "%s %s", mname, model);
+				return out;
+			}
+			if (model) {
+				snprintf(out, out_sz, "%s", model);
+				return out;
+			}
+			if (mname) {
+				snprintf(out, out_sz, "%s", mname);
+				return out;
+			}
+		}
+	}
+#endif
+
+	/* Fallback: keep old behavior. */
+	if (mtd->name && mtd->name[0]) {
+		snprintf(out, out_sz, "%s", mtd->name);
+		return out;
+	}
+
+	return "";
+}
+#endif
+
+static void backupinfo_handler(enum httpd_uri_handler_status status,
+			       struct httpd_request *request,
+			       struct httpd_response *response)
+{
+	char *buf;
+	int len = 0;
+	int left = 16384;
+
+	if (status == HTTP_CB_CLOSED) {
+		free(response->session_data);
+		return;
+	}
+
+	if (status != HTTP_CB_NEW)
+		return;
+
+	buf = malloc(left);
+	if (!buf) {
+		response->status = HTTP_RESP_STD;
+		response->data = "{}";
+		response->size = strlen(response->data);
+		response->info.code = 500;
+		response->info.connection_close = 1;
+		response->info.content_type = "application/json";
+		return;
+	}
+
+	len += snprintf(buf + len, left - len, "{");
+
+	/* MMC info + partitions */
+	len += snprintf(buf + len, left - len, "\"mmc\":{");
+#ifdef CONFIG_MTK_BOOTMENU_MMC
+	{
+		struct mmc *mmc;
+		struct blk_desc *bd;
+		bool present;
+
+		mmc = _mmc_get_dev(CONFIG_MTK_BOOTMENU_MMC_DEV_INDEX, 0, false);
+		bd = mmc ? mmc_get_blk_desc(mmc) : NULL;
+		present = mmc && bd && bd->type != DEV_TYPE_UNKNOWN;
+
+		if (present) {
+			len += snprintf(buf + len, left - len,
+				"\"present\":true,\"vendor\":\"%s\",\"product\":\"%s\",\"blksz\":%lu,\"size\":%llu,",
+				bd->vendor, bd->product, (unsigned long)bd->blksz,
+				(unsigned long long)mmc->capacity_user);
+		} else {
+			len += snprintf(buf + len, left - len, "\"present\":false,");
+		}
+
+		len += snprintf(buf + len, left - len, "\"parts\":[");
+#ifdef CONFIG_PARTITIONS
+		if (present) {
+			struct disk_partition dpart;
+			u32 i = 1;
+			bool first = true;
+
+			part_init(bd);
+			while (len < left - 128) {
+				if (part_get_info(bd, i, &dpart))
+					break;
+
+				if (!dpart.name[0]) {
+					i++;
+					continue;
+				}
+
+				len += snprintf(buf + len, left - len,
+					"%s{\"name\":\"%s\",\"size\":%llu}",
+					first ? "" : ",",
+					dpart.name,
+					(unsigned long long)dpart.size * dpart.blksz);
+
+				first = false;
+				i++;
+			}
+		}
+#endif
+		len += snprintf(buf + len, left - len, "]");
+	}
+#else
+	len += snprintf(buf + len, left - len, "\"present\":false,\"parts\":[]");
+#endif
+	len += snprintf(buf + len, left - len, "},");
+
+	/* MTD info + partitions */
+	len += snprintf(buf + len, left - len, "\"mtd\":{");
+#ifdef CONFIG_MTD
+	{
+		struct mtd_info *mtd, *sel = NULL;
+		u32 i;
+		bool first = true;
+		const char *model = NULL;
+		char model_buf[128];
+		int type = -1;
+		bool present = false;
+
+		gen_mtd_probe_devices();
+
+		/* Prefer a master MTD device (mtd->parent == NULL) for chip model info. */
+		for (i = 0; i < 64; i++) {
+			mtd = get_mtd_device(NULL, i);
+			if (IS_ERR(mtd))
+				continue;
+
+			if (!sel) {
+				sel = mtd;
+			} else {
+				if (mtd->parent) {
+					put_mtd_device(mtd);
+					continue;
+				}
+
+				/* Found master: replace current selection. */
+				put_mtd_device(sel);
+				sel = mtd;
+				break;
+			}
+
+			if (!mtd->parent)
+				break;
+		}
+
+		if (sel && !IS_ERR(sel)) {
+			present = true;
+			type = sel->type;
+			model = failsafe_get_mtd_chip_model(sel, model_buf, sizeof(model_buf));
+			put_mtd_device(sel);
+		}
+
+		len += snprintf(buf + len, left - len,
+			"\"present\":%s,\"model\":\"%s\",\"type\":%d,",
+			present ? "true" : "false",
+			model ? model : "", type);
+
+		len += snprintf(buf + len, left - len, "\"parts\":[");
+		for (i = 0; i < 64 && len < left - 128; i++) {
+			mtd = get_mtd_device(NULL, i);
+			if (IS_ERR(mtd))
+				continue;
+
+			if (!mtd->name || !mtd->name[0]) {
+				put_mtd_device(mtd);
+				continue;
+			}
+
+			len += snprintf(buf + len, left - len,
+				"%s{\"name\":\"%s\",\"size\":%llu,\"master\":%s}",
+				first ? "" : ",",
+				mtd->name,
+				(unsigned long long)mtd->size,
+				mtd->parent ? "false" : "true");
+
+			first = false;
+			put_mtd_device(mtd);
+		}
+		len += snprintf(buf + len, left - len, "]");
+	}
+#else
+	len += snprintf(buf + len, left - len, "\"present\":false,\"parts\":[]");
+#endif
+	len += snprintf(buf + len, left - len, "}");
+	len += snprintf(buf + len, left - len, "}");
+
+	response->status = HTTP_RESP_STD;
+	response->data = buf;
+	response->size = strlen(buf);
+	response->info.code = 200;
+	response->info.connection_close = 1;
+	response->info.content_type = "application/json";
+
+	/* response data must stay valid until sent */
+	response->session_data = buf;
+}
+
+static void backup_handler(enum httpd_uri_handler_status status,
+			   struct httpd_request *request,
+			   struct httpd_response *response)
+{
+	struct backup_session *st;
+	struct httpd_form_value *mode, *storage, *target, *start, *end;
+	char target_name[64] = "";
+	char storage_sel[16] = "auto";
+	u64 off_start = 0, off_end = 0;
+	int ret;
+
+	if (status == HTTP_CB_NEW) {
+		mode = httpd_request_find_value(request, "mode");
+		storage = httpd_request_find_value(request, "storage");
+		target = httpd_request_find_value(request, "target");
+		start = httpd_request_find_value(request, "start");
+		end = httpd_request_find_value(request, "end");
+
+		if (storage && storage->data)
+			strlcpy(storage_sel, storage->data, sizeof(storage_sel));
+
+		if (!mode || !mode->data || !target || !target->data)
+			goto bad;
+
+		strlcpy(target_name, target->data, sizeof(target_name));
+
+		/* allow overriding storage by target prefix: mtd:<name> / mmc:<name> */
+		if (!strncmp(target_name, "mtd:", 4)) {
+			memmove(target_name, target_name + 4, strlen(target_name + 4) + 1);
+			strlcpy(storage_sel, "mtd", sizeof(storage_sel));
+		} else if (!strncmp(target_name, "mmc:", 4)) {
+			memmove(target_name, target_name + 4, strlen(target_name + 4) + 1);
+			strlcpy(storage_sel, "mmc", sizeof(storage_sel));
+		}
+
+		if (!strcmp(mode->data, "part")) {
+			off_start = 0;
+			off_end = ULLONG_MAX;
+		} else if (!strcmp(mode->data, "range")) {
+			if (!start || !end || !start->data || !end->data)
+				goto bad;
+
+			if (parse_u64_len(start->data, &off_start))
+				goto bad;
+			if (parse_u64_len(end->data, &off_end))
+				goto bad;
+		} else {
+			goto bad;
+		}
+
+		st = calloc(1, sizeof(*st));
+		if (!st)
+			goto oom;
+
+		st->buf_size = 64 * 1024;
+		st->buf = malloc(st->buf_size);
+		if (!st->buf) {
+			free(st);
+			goto oom;
+		}
+
+		/* open target and get size */
+		if (!strcasecmp(storage_sel, "mtd") ||
+		    (!strcasecmp(storage_sel, "auto") && mtd_part_exists(target_name))) {
+#ifdef CONFIG_MTD
+			gen_mtd_probe_devices();
+			st->mtd = get_mtd_device_nm(target_name);
+			if (IS_ERR(st->mtd)) {
+				st->mtd = NULL;
+				goto bad_target;
+			}
+
+			st->src = BACKUP_SRC_MTD;
+			st->target_size = st->mtd->size;
+#else
+			goto bad_target;
+#endif
+		} else {
+			/* MMC path */
+#ifdef CONFIG_MTK_BOOTMENU_MMC
+			st->mmc = _mmc_get_dev(CONFIG_MTK_BOOTMENU_MMC_DEV_INDEX, 0, false);
+			if (!st->mmc)
+				goto bad_target;
+
+			st->src = BACKUP_SRC_MMC;
+			if (!strcmp(target_name, "raw")) {
+				st->mmc_base = 0;
+				st->target_size = st->mmc->capacity_user;
+			} else {
+				ret = _mmc_find_part(st->mmc, target_name, &st->dpart, true);
+				if (ret)
+					goto bad_target;
+
+				st->mmc_base = (u64)st->dpart.start * st->dpart.blksz;
+				st->target_size = (u64)st->dpart.size * st->dpart.blksz;
+			}
+#else
+			goto bad_target;
+#endif
+		}
+
+		/* range normalization */
+		if (!strcmp(mode->data, "part")) {
+			off_start = 0;
+			off_end = st->target_size;
+		}
+
+		if (off_end == ULLONG_MAX)
+			off_end = st->target_size;
+
+		if (off_start >= off_end)
+			goto bad_range;
+		if (off_end > st->target_size)
+			goto bad_range;
+
+		st->start = off_start;
+		st->end = off_end;
+		st->total = st->end - st->start;
+		st->cur = 0;
+		st->phase = BACKUP_PHASE_HDR;
+
+		/* filename */
+		{
+			char model[64] = "";
+			const char *stype = st->src == BACKUP_SRC_MTD ? "mtd" : "mmc";
+
+			if (st->src == BACKUP_SRC_MMC) {
+#ifdef CONFIG_MTK_BOOTMENU_MMC
+				struct blk_desc *bd = mmc_get_blk_desc(st->mmc);
+				if (bd)
+					strlcpy(model, bd->product, sizeof(model));
+#endif
+			} else {
+#ifdef CONFIG_MTD
+				if (st->mtd && st->mtd->name)
+					strlcpy(model, st->mtd->name, sizeof(model));
+#endif
+			}
+
+			str_sanitize_component(model);
+			str_sanitize_component(target_name);
+
+			snprintf(st->filename, sizeof(st->filename),
+				"backup_%s_%s_%s_0x%llx-0x%llx.bin",
+				stype,
+				model[0] ? model : "device",
+				target_name,
+				(unsigned long long)st->start,
+				(unsigned long long)st->end);
+		}
+
+		/* build HTTP header (CUSTOM response must include header) */
+		st->hdr_len = snprintf(st->hdr, sizeof(st->hdr),
+			"HTTP/1.1 200 OK\r\n"
+			"Content-Type: application/octet-stream\r\n"
+			"Content-Length: %llu\r\n"
+			"Content-Disposition: attachment; filename=\"%s\"\r\n"
+			"Cache-Control: no-store\r\n"
+			"Connection: close\r\n"
+			"\r\n",
+			(unsigned long long)st->total,
+			st->filename);
+
+		response->session_data = st;
+		response->status = HTTP_RESP_CUSTOM;
+		response->data = st->hdr;
+		response->size = st->hdr_len;
+		return;
+	}
+
+	if (status == HTTP_CB_RESPONDING) {
+		u64 remain;
+		size_t to_read, got = 0;
+
+		st = response->session_data;
+		if (!st) {
+			response->status = HTTP_RESP_NONE;
+			return;
+		}
+
+		if (st->phase == BACKUP_PHASE_HDR)
+			st->phase = BACKUP_PHASE_DATA;
+
+		remain = st->total - st->cur;
+		if (!remain) {
+			response->status = HTTP_RESP_NONE;
+			return;
+		}
+
+		to_read = (size_t)min_t(u64, remain, st->buf_size);
+
+		if (st->src == BACKUP_SRC_MTD) {
+#ifdef CONFIG_MTD
+			size_t readsz = 0;
+
+			ret = mtd_read_skip_bad(st->mtd, st->start + st->cur,
+					to_read,
+					st->mtd->size - (st->start + st->cur),
+					&readsz, st->buf);
+			if (ret)
+				goto io_err;
+
+			got = readsz;
+#else
+			goto io_err;
+#endif
+		} else {
+#ifdef CONFIG_MTK_BOOTMENU_MMC
+			ret = mmc_read_generic(CONFIG_MTK_BOOTMENU_MMC_DEV_INDEX, 0,
+					st->mmc_base + st->start + st->cur,
+					st->buf, to_read);
+			if (ret)
+				goto io_err;
+
+			got = to_read;
+#else
+			goto io_err;
+#endif
+		}
+
+		if (!got)
+			goto io_err;
+
+		st->cur += got;
+
+		response->status = HTTP_RESP_CUSTOM;
+		response->data = (const char *)st->buf;
+		response->size = got;
+		return;
+
+	io_err:
+		response->status = HTTP_RESP_NONE;
+		return;
+	}
+
+	if (status == HTTP_CB_CLOSED) {
+		st = response->session_data;
+		if (st) {
+#ifdef CONFIG_MTD
+			if (st->mtd)
+				put_mtd_device(st->mtd);
+#endif
+			free(st->buf);
+			free(st);
+		}
+	}
+
+	return;
+
+bad:
+	response->status = HTTP_RESP_STD;
+	response->data = "bad request";
+	response->size = strlen(response->data);
+	response->info.code = 400;
+	response->info.connection_close = 1;
+	response->info.content_type = "text/plain";
+	return;
+
+bad_target:
+	response->status = HTTP_RESP_STD;
+	response->data = "target not found";
+	response->size = strlen(response->data);
+	response->info.code = 404;
+	response->info.connection_close = 1;
+	response->info.content_type = "text/plain";
+#ifdef CONFIG_MTD
+	if (st->mtd)
+		put_mtd_device(st->mtd);
+#endif
+	free(st->buf);
+	free(st);
+	return;
+
+bad_range:
+	response->status = HTTP_RESP_STD;
+	response->data = "invalid range";
+	response->size = strlen(response->data);
+	response->info.code = 400;
+	response->info.connection_close = 1;
+	response->info.content_type = "text/plain";
+#ifdef CONFIG_MTD
+	if (st->mtd)
+		put_mtd_device(st->mtd);
+#endif
+	free(st->buf);
+	free(st);
+	return;
+
+oom:
+	response->status = HTTP_RESP_STD;
+	response->data = "no mem";
+	response->size = strlen(response->data);
+	response->info.code = 500;
+	response->info.connection_close = 1;
+	response->info.content_type = "text/plain";
+	return;
 }
 
 
@@ -116,6 +993,12 @@ static void upload_handler(enum httpd_uri_handler_status status,
 
 	if (status != HTTP_CB_NEW)
 		return;
+
+	/* new upload session identifier */
+	fs_upload_id = rand();
+#ifdef CONFIG_MEDIATEK_MULTI_MTD_LAYOUT
+	mtd_layout_label = NULL;
+#endif
 
 	response->status = HTTP_RESP_STD;
 	response->info.code = 200;
@@ -157,6 +1040,14 @@ static void upload_handler(enum httpd_uri_handler_status status,
 		goto done;
 	}
 
+	fw = httpd_request_find_value(request, "factory");
+	if (fw) {
+		fw_type = FW_TYPE_FACTORY;
+		if (failsafe_validate_image(fw->data, fw->size, fw_type))
+			goto fail;
+		goto done;
+	}
+
 	fw = httpd_request_find_value(request, "initramfs");
 	if (fw) {
 		fw_type = FW_TYPE_INITRD;
@@ -171,7 +1062,7 @@ fail:
 	return;
 
 done:
-	upload_data_id = upload_id;
+	upload_data_id = fs_upload_id;
 	upload_data = fw->data;
 	upload_size = fw->size;
 
@@ -250,7 +1141,7 @@ static void result_handler(enum httpd_uri_handler_status status,
 			return;
 		}
 
-		if (upload_data_id == upload_id) {
+		if (upload_data_id == fs_upload_id) {
 #ifdef CONFIG_MEDIATEK_MULTI_MTD_LAYOUT
 			if (mtd_layout_label &&
 					strcmp(get_mtd_layout_label(), mtd_layout_label) != 0) {
@@ -335,6 +1226,7 @@ static void html_handler(enum httpd_uri_handler_status status,
 }
 
 #ifdef CONFIG_MEDIATEK_MULTI_MTD_LAYOUT
+
 static const char *get_mtdlayout_str(void)
 {
 	static char mtd_layout_str[MTD_LAYOUTS_MAXLEN];
@@ -395,14 +1287,22 @@ int start_web_failsafe(void)
 	httpd_register_uri_handler(inst, "/booting.html", &html_handler, NULL);
 	httpd_register_uri_handler(inst, "/cgi-bin/luci", &index_handler, NULL);
 	httpd_register_uri_handler(inst, "/cgi-bin/luci/", &index_handler, NULL);
+	httpd_register_uri_handler(inst, "/backup.html", &html_handler, NULL);
+	httpd_register_uri_handler(inst, "/backupinfo", &backupinfo_handler, NULL);
+	httpd_register_uri_handler(inst, "/backup", &backup_handler, NULL);
+	httpd_register_uri_handler(inst, "/sysinfo", &sysinfo_handler, NULL);
+	httpd_register_uri_handler(inst, "/factory.html", &html_handler, NULL);
 	httpd_register_uri_handler(inst, "/fail.html", &html_handler, NULL);
 	httpd_register_uri_handler(inst, "/flashing.html", &html_handler, NULL);
 	httpd_register_uri_handler(inst, "/getmtdlayout", &mtd_layout_handler, NULL);
 #ifdef CONFIG_MTK_BOOTMENU_MMC
-	httpd_register_uri_handler(inst, "/gpt.html", &html_handler, NULL);
+	if (failsafe_mmc_present())
+		httpd_register_uri_handler(inst, "/gpt.html", &html_handler, NULL);
 #endif
 	httpd_register_uri_handler(inst, "/initramfs.html", &html_handler, NULL);
 	httpd_register_uri_handler(inst, "/main.js", &js_handler, NULL);
+	httpd_register_uri_handler(inst, "/reboot", &reboot_handler, NULL);
+	httpd_register_uri_handler(inst, "/reboot.html", &html_handler, NULL);
 	httpd_register_uri_handler(inst, "/result", &result_handler, NULL);
 	httpd_register_uri_handler(inst, "/style.css", &style_handler, NULL);
 	httpd_register_uri_handler(inst, "/uboot.html", &html_handler, NULL);

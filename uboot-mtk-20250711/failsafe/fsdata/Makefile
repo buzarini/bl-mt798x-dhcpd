@@ -17,6 +17,14 @@ obj-y += booting.o
 FILE_booting.o := booting.html
 FSPATH_booting.o := booting.html
 
+obj-y += backup.o
+FILE_backup.o := backup.html
+FSPATH_backup.o := backup.html
+
+obj-y += factory.o
+FILE_factory.o := factory.html
+FSPATH_factory.o := factory.html
+
 obj-y += fail.o
 FILE_fail.o := fail.html
 FSPATH_fail.o := fail.html
@@ -40,6 +48,10 @@ FSPATH_initramfs.o := initramfs.html
 obj-y += main.o
 FILE_main.o := main.js
 FSPATH_main.o := main.js
+
+obj-y += reboot.o
+FILE_reboot.o := reboot.html
+FSPATH_reboot.o := reboot.html
 
 obj-y += style.o
 FILE_style.o := style.css
